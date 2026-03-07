@@ -1,28 +1,30 @@
 <?php
-require_once __DIR__ . '/../vendor/autoload.php';
+require __DIR__ . '/../vendor/autoload.php';
 
 use Peshk\Web\App;
 
-$app = new App([
-    'root_path' => __DIR__ . '/../web',
-    'timezone' => 'UTC'
-]);
+// Configurações da aplicação
+$config = [
+    'root_path' => __DIR__, // Onde estão /pages e /api
+    'debug'     => true,
+    // 'context_domain' => 'client_a', // Opcional: para subdomínios/contextos
+];
 
-// Registrar boot callable
-$app->boot(function (App $app) {
-    // $container = $app->getContainer();
+$app = new App($config);
 
-    // Registrar serviços
-    // $container->add('db', function () {
-    //     return new PDO('mysql:host=localhost;dbname=test', 'user', 'pass');
-    // });
+// Opcional: Configurar o Container no Boot
+$app->boot(function ($app) {
+    $container = $app->getContainer();
+
+    // Se um middleware precisar de dependências, registre-o aqui
+    // $container->add(App\Middlewares\AuthMiddleware::class)
+    //           ->addArgument(App\Services\Database::class);
 });
 
-// Middlewares
-$app->addMiddlewares([
-    // \App\Middleware\AuthMiddleware::class,
-    // \App\Middleware\LoggingMiddleware::class,
+// Adicionar Middlewares Globais ou por Rota
+// $app->addGlobalMiddleware(App\Middlewares\LogMiddleware::class);
+$app->addRouteMiddleware([
 ]);
 
-// Executa
+// Executa tudo!
 $app->run();

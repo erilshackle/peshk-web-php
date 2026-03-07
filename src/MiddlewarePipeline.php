@@ -1,38 +1,56 @@
 <?php
+
 namespace Peshk\Web;
 
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Server\MiddlewareInterface;
-use Nyholm\Psr7\Factory\Psr17Factory;
+use Psr\Http\Server\RequestHandlerInterface;
+use League\Container\Container;
 
-/**
- * === MiddlewarePipeline ===
- * Executa middlewares encadeados usando closures.
- */
-class MiddlewarePipeline
+class MiddlewarePipeline implements RequestHandlerInterface
 {
-    private array $middlewares = [];
-    private \Closure $finalHandler;
+    protected array $middlewares;
+    protected \Closure $finalHandler;
+    protected ?Container $container;
+    protected int $index = 0;
 
-    public function __construct(array $middlewares, \Closure $finalHandler)
+    public function __construct(array $middlewares, \Closure $finalHandler, ?Container $container = null)
     {
-        $this->middlewares = $middlewares;
+        $this->middlewares = array_values($middlewares);
         $this->finalHandler = $finalHandler;
+        $this->container = $container;
     }
 
     public function handle(ServerRequestInterface $request): ResponseInterface
     {
-        $index = 0;
-        $pipeline = function(ServerRequestInterface $req) use (&$pipeline, &$index): ResponseInterface {
-            if (!isset($this->middlewares[$index])) {
-                return ($this->finalHandler)($req);
-            }
-            $middleware = $this->middlewares[$index];
-            $index++;
-            return $middleware->process($req, $pipeline);
-        };
+        if (!isset($this->middlewares[$this->index])) {
+            return ($this->finalHandler)($request);
+        }
 
-        return $pipeline($request);
+        $entry = $this->middlewares[$this->index];
+        $this->index++;
+
+        $middleware = $this->resolve($entry);
+        return $middleware->process($request, $this);
+    }
+
+    protected function resolve($entry): MiddlewareInterface
+    {
+        if ($entry instanceof MiddlewareInterface) return $entry;
+
+        if (is_string($entry)) {
+            // Lazy Loading via Container (se existir)
+            if ($this->container && $this->container->has($entry)) {
+                $instance = $this->container->get($entry);
+            } else {
+                // Instanciação direta (Standard)
+                $instance = new $entry();
+            }
+
+            if ($instance instanceof MiddlewareInterface) return $instance;
+        }
+
+        throw new \RuntimeException("Falha ao resolver middleware: " . (is_string($entry) ? $entry : gettype($entry)));
     }
 }

@@ -13,150 +13,141 @@ class App
 {
     protected Container $container;
     protected WebRequestHandler $router;
+    protected array $config;
     protected ?\Closure $bootCallable = null;
 
     /**
-     * Summary of __construct
-     * @param array{
-     *     root_path?: string,
-     *     timezone?: string
-     * } $config
+     * @param array $config Configurações globais (debug, root_path, context_domain, etc.)
      */
     public function __construct(array $config = [])
     {
+        $this->config = $config;
         $this->container = new Container();
 
-        // Auto-wiring
-        $this->container->delegate(
-            new ReflectionContainer(true)
-        );
+        // Ativa auto-wiring para resolver dependências automaticamente
+        $this->container->delegate(new ReflectionContainer(true));
 
+        // Registra o container e as configs para uso em Middlewares/Controllers
         $this->container->add('config', $config);
+        $this->container->add(Container::class, $this->container)->setShared(true);
 
-        $this->container->add(Psr17Factory::class)
-            ->setShared(true);
+        // Factory PSR-17 compartilhada
+        $this->container->add(Psr17Factory::class)->setShared(true);
 
-        $rootPath = $config['root_path'] ?? __DIR__ . '/web';
-
-
-        // Router NÃO depende do container
-        $this->router = new WebRequestHandler($rootPath);
+        // Instancia o WRH com a nova assinatura
+        $webRoot = $config['root_path'] ?? getcwd() . '/../web';
+        $this->router = new WebRequestHandler($webRoot, [
+            'container' => $this->container,
+            'context_domain' => $config['domain'] ?? null
+        ]);
     }
 
+    /**
+     * Define um callback de inicialização para registrar serviços extras ou middlewares.
+     */
     public function boot(callable $callback): self
     {
         $this->bootCallable = \Closure::fromCallable($callback);
         return $this;
     }
 
-    public function getContainer(): Container
-    {
-        return $this->container;
-    }
-
-    public function getRouter(): WebRequestHandler
-    {
-        return $this->router;
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Middleware Methods
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Adiciona middleware global
+     * Atalho para adicionar middlewares globais via App
      */
-    public function addMiddleware(string $middlewareClass): self
+    public function addGlobalMiddleware(string|MiddlewareInterface ...$middlewares): self
     {
-        $instance = $this->resolveMiddleware($middlewareClass);
-        $this->router->addGlobalMiddleware($instance);
-
+        foreach ($middlewares as $mw) {
+            $this->router->addMiddleware($mw);
+        }
         return $this;
     }
 
     /**
-     * Adiciona múltiplos middlewares globais
+     * Atalho para adicionar middlewares por rota via App
+     * @param array $rules Ex: ['admin/*' => [AuthMiddleware::class, LogMiddleware::class], 'api/*' => ApiAuthMiddleware::class]
      */
-    public function addMiddlewares(array $middlewares): self
+    public function addRouteMiddleware(array $rules): self
     {
-        foreach ($middlewares as $middlewareClass) {
-            $this->addMiddleware($middlewareClass);
+        foreach ($rules as $pattern => $middlewares) {
+            $this->router->addRouteMiddleware($pattern, $middlewares);
         }
-
         return $this;
     }
 
     /**
-     * Adiciona middleware por padrão de rota (wildcard)
+     * Executa a aplicação
      */
-    public function addRouteMiddleware(string $pattern, array $middlewares): self
-    {
-        $instances = [];
-
-        foreach ($middlewares as $middlewareClass) {
-            $instances[] = $this->resolveMiddleware($middlewareClass);
-        }
-
-        $this->router->addRouteMiddlewares($pattern, $instances);
-
-        return $this;
-    }
-
-    /**
-     * Resolve middleware via container
-     */
-    protected function resolveMiddleware(string $middlewareClass): MiddlewareInterface
-    {
-        $instance = $this->container->get($middlewareClass);
-
-        if (!$instance instanceof MiddlewareInterface) {
-            throw new \RuntimeException(
-                "Middleware {$middlewareClass} must implement MiddlewareInterface"
-            );
-        }
-
-        return $instance;
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Run Application
-    |--------------------------------------------------------------------------
-    */
-
     public function run(): void
     {
-        if ($this->bootCallable) {
-            ($this->bootCallable)($this);
+        try {
+            // Executa o boot se definido
+            if ($this->bootCallable) {
+                ($this->bootCallable)($this);
+            }
+
+            // Cria a Request PSR-7 a partir das globais do PHP
+            $psr17 = $this->container->get(Psr17Factory::class);
+            $creator = new ServerRequestCreator($psr17, $psr17, $psr17, $psr17);
+            $request = $creator->fromGlobals();
+
+            // O Router assume o controle do fluxo
+            $response = $this->router->handle($request);
+
+            // Envia a resposta final para o navegador
+            $this->send($response);
+        } catch (\Throwable $e) {
+            $this->handleException($e);
         }
-
-        $psr17 = $this->container->get(Psr17Factory::class);
-
-        $creator = new ServerRequestCreator(
-            $psr17,
-            $psr17,
-            $psr17,
-            $psr17
-        );
-
-        $request = $creator->fromGlobals();
-
-        $response = $this->router->handle($request);
-
-        $this->sendResponse($response);
     }
 
-    protected function sendResponse(ResponseInterface $response): void
+    /**
+     * Tratamento de exceções não capturadas (Erro 500)
+     */
+    protected function handleException(\Throwable $e): void
     {
+        $isDebug = $this->config['debug'] ?? false;
+
+        // Em produção, você logaria o erro aqui
+        // error_log($e->getMessage());
+
+        if (!headers_sent()) {
+            http_response_code(500);
+            header('Content-Type: text/html; charset=utf-8');
+        }
+
+        if ($isDebug) {
+            echo "<h2>500 - Internal Server Error</h2>";
+            echo "<p><strong>Message:</strong> {$e->getMessage()}</p>";
+            echo "<p><strong>File:</strong> {$e->getFile()} (line {$e->getLine()})</p>";
+            echo "<pre>{$e->getTraceAsString()}</pre>";
+        } else {
+            echo "<h1>Algo deu errado.</h1><p>Nossa equipe técnica já foi avisada.</p>";
+        }
+    }
+
+    /**
+     * Emite cabeçalhos e corpo da resposta PSR-7
+     */
+    protected function send(ResponseInterface $response): void
+    {
+        if (headers_sent()) return;
+
+        // Status
+        header(sprintf(
+            'HTTP/%s %s %s',
+            $response->getProtocolVersion(),
+            $response->getStatusCode(),
+            $response->getReasonPhrase()
+        ), true, $response->getStatusCode());
+
+        // Headers
         foreach ($response->getHeaders() as $name => $values) {
             foreach ($values as $value) {
                 header("$name: $value", false);
             }
         }
 
-        http_response_code($response->getStatusCode());
+        // Body
         echo $response->getBody();
     }
 }

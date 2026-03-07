@@ -6,30 +6,64 @@ use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Server\MiddlewareInterface;
+use League\Container\Container;
 
+/**
+ * Gerenciador de requisições Web baseado em sistema de arquivos.
+ * Resolve rotas estáticas, dinâmicas, APIs e arquivos especiais (@layouts, @guards, etc).
+ */
 class WebRequestHandler
 {
+    /** @var string Caminho físico base para /pages e /api */
     protected string $webPath;
+
+    /** @var array Middlewares globais aplicados a todas as rotas */
     protected array $middlewares = [];
+
+    /** @var array Regras de middlewares baseadas em padrões de URL */
     protected array $routeMiddlewareRules = [];
+
+    /** @var Container|null Container de dependências para resolver middlewares e controllers */
+    protected ?Container $container;
+
+    /** @var Psr17Factory Fábrica de objetos PSR-7 */
     protected Psr17Factory $factory;
 
-    public function __construct(string $webPath)
+    /**
+     * @param string $webRoot Caminho absoluto da pasta web (ex: BASE_DIR/web)
+     * @param array{
+     *  context_domain?: string,  // Nome da subpasta de contexto (subdomínio/projeto)
+     *  container?: Container     // Instância do container League/Container
+     * } $options
+     */
+    public function __construct(string $webRoot, array $options = [])
     {
-        $this->webPath = rtrim($webPath, '/');
+        $root = rtrim($webRoot, '/');
+
+        // Se houver um contexto (ex: um subdomínio), concatena ao caminho root
+        if (!empty($options['context_domain'])) {
+            $root .= '/' . trim($options['context_domain'], '/');
+        }
+
+        $this->webPath = realpath($root) ?: $root;
+        $this->container = $options['container'] ?? null;
         $this->factory = new Psr17Factory();
     }
 
-    /*--------------------------------------------------------------------
-     | Middleware registration
-     --------------------------------------------------------------------*/
-    public function addGlobalMiddleware(MiddlewareInterface|string $middleware): self
+    /**
+     * Adiciona um middleware à pilha global.
+     * @param MiddlewareInterface|string $middleware Objeto ou nome da classe no container.
+     */
+    public function addMiddleware(MiddlewareInterface|string $middleware): self
     {
         $this->middlewares[] = $middleware;
         return $this;
     }
 
-    public function addRouteMiddlewares(string $pattern, array $middlewares): self
+    /**
+     * Adiciona middlewares para um padrão de rota específico (ex: 'admin/*').
+     */
+    public function addRouteMiddleware(string $pattern, array $middlewares): self
     {
         $this->routeMiddlewareRules[] = [
             'pattern' => trim($pattern, '/'),
@@ -38,283 +72,256 @@ class WebRequestHandler
         return $this;
     }
 
-    /*--------------------------------------------------------------------
-     | Handle request
-     --------------------------------------------------------------------*/
+    /**
+     * Monta o caminho base físico e limpa os segmentos da URL
+     */
+    protected function mountPath(ServerRequestInterface $request): array
+    {
+        $isApi = $this->isApiRoute($request);
+        $uri = trim($request->getUri()->getPath(), '/');
+        $segments = array_filter(explode('/', $uri));
+
+        // Se for api, removemos o primeiro segmento ('api') para o scan de pastas
+        if ($isApi && ($segments[0] ?? '') === 'api') {
+            array_shift($segments);
+        }
+
+        return [
+            'base' => $isApi ? $this->webPath . '/api' : $this->webPath . '/pages',
+            'segments' => array_values($segments),
+            'uri' => $uri
+        ];
+    }
+
+    /**
+     * Resolve o ciclo de vida da requisição.
+     */
     public function handle(ServerRequestInterface $request): ResponseInterface
     {
-        $uriPath = trim($request->getUri()->getPath(), '/');
-        $parts = $uriPath === '' ? [] : explode('/', $uriPath);
-        $basePath = $this->resolveBasePath($uriPath);
+        // 1. Resolve onde estamos (API ou Pages)
+        $mount = $this->mountPath($request);
+        $isApi = $this->isApiRoute($request);
 
-        $routeInfo = $this->scanDirectory($basePath, $parts);
-        $middlewares = $this->collectMiddlewares($uriPath, $routeInfo);
+        $context = [
+            'file' => null,
+            'params' => [],
+            'layouts' => [],
+            'middlewares' => $this->middlewares,
+            'error404' => null,
+            'controller' => null
+        ];
 
-        $finalHandler = function (ServerRequestInterface $req) use ($routeInfo) {
-            [$file, $params] = $routeInfo ?? [null, []];
-            foreach ($params as $k => $v) {
+        // 2. Coleta middlewares globais por pattern
+        $this->applyRouteMiddlewareRules($mount['uri'], $context);
+
+        // 3. Scanner (Recursão nas pastas)
+        $this->scanDirectory($mount['base'], $mount['segments'], $mount['uri'], $context);
+
+        // 4. Handler Final
+        $finalHandler = function (ServerRequestInterface $req) use ($context, $isApi) {
+            foreach ($context['params'] as $k => $v) {
                 $req = $req->withAttribute($k, $v);
             }
-
-            return $this->execute($file, $req);
+            return $this->execute($context['file'], $req, $isApi, $context);
         };
 
-        $pipeline = new MiddlewarePipeline($middlewares, $finalHandler);
-
-        try {
-            return $pipeline->handle($request);
-        } catch (\Throwable $e) {
-            return $this->factory->createResponse(500)
-                ->withHeader('Content-Type', 'text/html')
-                ->withBody($this->factory->createStream(
-                    "<h1>500 - Internal Server Error</h1><pre>{$e->getMessage()}</pre>"
-                ));
-        }
+        // 5. Dispara a Pipeline
+        $pipeline = new MiddlewarePipeline(
+            $context['middlewares'],
+            $finalHandler,
+            $this->container // Pode ser null ou a instância vinda do App
+        );
+        return $pipeline->handle($request);
     }
 
-    /*--------------------------------------------------------------------
-     | Base path resolver (web/pages ou api)
-     --------------------------------------------------------------------*/
-    protected function resolveBasePath(string $uriPath): string
+    /**
+     * Verifica se a rota é destinada à API.
+     */
+    public function isApiRoute(ServerRequestInterface $request): bool
     {
-        return str_starts_with($uriPath, 'api/')
-            ? $this->webPath . '/api'
-            : $this->webPath . '/pages';
+        $path = trim($request->getUri()->getPath(), '/');
+        return str_starts_with($path, 'api/') || $path === 'api';
     }
 
-    /*--------------------------------------------------------------------
-     | Middleware collection
-     --------------------------------------------------------------------*/
-    protected function collectMiddlewares(string $path, ?array $routeInfo): array
+    /**
+     * Percorre as pastas de forma recursiva buscando a rota e coletando @meta arquivos.
+     */
+    protected function scanDirectory(string $dir, array $parts, string $fullUri, array &$context): void
     {
-        $wild = $this->matchWildcardMiddlewares($path);
-        $local = $routeInfo ? $this->loadLocalMiddlewares($routeInfo[0]) : [];
-        $all = array_merge($this->middlewares, $wild, $local);
+        if (!is_dir($dir)) return;
 
-        return array_map(fn($m) => $m instanceof MiddlewareInterface ? $m : new $m(), $all);
-    }
+        // Anexa arquivos especiais desta pasta (@guard, @layout, etc)
+        $this->attachSpecialFiles($dir, $fullUri, $context);
 
-    protected function matchWildcardMiddlewares(string $path): array
-    {
-        $out = [];
-        foreach ($this->routeMiddlewareRules as $rule) {
-            $pattern = "#^" . str_replace('*', '.*', $rule['pattern']) . "$#";
-            if (preg_match($pattern, $path)) {
-                $out = array_merge($out, $rule['middlewares']);
-            }
-        }
-        return $out;
-    }
-
-    protected function loadLocalMiddlewares(string $filePath): array
-    {
-        $result = [];
-        $dir = dirname($filePath);
-        while (str_starts_with($dir, $this->webPath)) {
-            $midFile = "$dir/@middlewares.php";
-            if (file_exists($midFile)) {
-                $list = include $midFile;
-                if (is_array($list)) $result = array_merge($result, $list);
-            }
-            if ($dir === $this->webPath) break;
-            $dir = dirname($dir);
-        }
-        return array_reverse($result);
-    }
-
-    /*--------------------------------------------------------------------
-     | Directory scanning + dynamic segments
-     --------------------------------------------------------------------*/
-    protected function scanDirectory(
-        string $dir,
-        array $parts,
-        int $depth = 0,
-        array $params = []
-    ): ?array {
-
-        if (!is_dir($dir)) {
-            return null;
-        }
-
-        // Se terminou os segmentos → procurar index.php
-        if (!isset($parts[$depth])) {
+        // Se não há mais segmentos, tenta o index.php da pasta atual
+        if (empty($parts)) {
             $index = $dir . '/index.php';
-            return file_exists($index)
-                ? [$index, $params]
-                : null;
+            if (file_exists($index)) $context['file'] = $index;
+            return;
         }
 
-        $segment = $parts[$depth];
+        $segment = array_shift($parts);
+        $staticFile = $dir . '/' . $segment . '.php';
+        $staticDir  = $dir . '/' . $segment;
 
-        $entries = scandir($dir);
-
-        $staticDir = null;
-        $dynamicDir = null;
-
-        foreach ($entries as $entry) {
-            if ($entry === '.' || $entry === '..') {
-                continue;
-            }
-
-            $fullPath = "$dir/$entry";
-
-            if (!is_dir($fullPath)) {
-                continue;
-            }
-
-            // Diretório estático
-            if ($entry === $segment) {
-                $staticDir = $fullPath;
-            }
-
-            // Diretório dinâmico [param]
-            elseif ($this->isDynamicSegment($entry)) {
-
-                if ($dynamicDir) {
-                    throw new \RuntimeException(
-                        "Ambiguous dynamic directories in $dir: $dynamicDir, $entry"
-                    );
-                }
-
-                $dynamicDir = $fullPath;
-            }
+        // Verificação de Ambiguidade: não permite arquivo e pasta com mesmo nome/index
+        if (file_exists($staticFile) && is_dir($staticDir) && file_exists($staticDir . '/index.php')) {
+            throw new \RuntimeException("Ambiguity detected: both $staticFile and $staticDir/index.php exist.");
         }
 
-        // 1️⃣ Prioridade: diretório estático
-        if ($staticDir) {
-            return $this->scanDirectory(
-                $staticDir,
-                $parts,
-                $depth + 1,
-                $params
-            );
+        // Prioridade 1: Arquivo estático
+        if (file_exists($staticFile) && empty($parts)) {
+            $context['file'] = $staticFile;
+            return;
         }
 
-        // 2️⃣ Diretório dinâmico
-        if ($dynamicDir) {
-            $paramName = trim(basename($dynamicDir), '[]');
-            $params[$paramName] = $segment;
-
-            return $this->scanDirectory(
-                $dynamicDir,
-                $parts,
-                $depth + 1,
-                $params
-            );
+        // Prioridade 2: Pasta estática (recursão)
+        if (is_dir($staticDir)) {
+            $this->scanDirectory($staticDir, $parts, $fullUri, $context);
+            return;
         }
 
-        return null;
+        // Prioridade 3: Segmento dinâmico [id], [slug], etc.
+        $dynamics = $this->findDynamicSegments($dir);
+        if ($dynamics) {
+            if (count($dynamics) > 1) throw new \RuntimeException("Multiple dynamic routes in $dir");
+
+            $match = $dynamics[0];
+            $paramName = trim(str_replace('.php', '', $match), '[]');
+            $context['params'][$paramName] = $segment;
+
+            $fullPathMatch = $dir . '/' . $match;
+            if (is_dir($fullPathMatch)) {
+                $this->scanDirectory($fullPathMatch, $parts, $fullUri, $context);
+            } elseif (empty($parts)) {
+                $context['file'] = $fullPathMatch;
+            }
+        }
     }
 
-    protected function isDynamicSegment(string $name): bool
+    /**
+     * Coleta metadados de arquivos especiais durante a navegação.
+     */
+    protected function attachSpecialFiles(string $dir, string $fullUri, array &$context): void
     {
-        return preg_match('/^\[.+\]$/', $name);
+        // @guard.php: se retornar false, interrompe o scan
+        if (file_exists("$dir/@guard.php")) {
+            $allowed = include "$dir/@guard.php";
+            if ($allowed === false) throw new \RuntimeException("Access forbidden by @guard", 403);
+        }
+
+        if (file_exists("$dir/@404.php")) $context['error404'] = "$dir/@404.php";
+        if (file_exists("$dir/@layout.php")) $context['layouts'][] = "$dir/@layout.php";
+        if (file_exists("$dir/@controller.php")) $context['controller'] = "$dir/@controller.php";
+
+        // @middlewares.php: anexa middlewares locais da pasta
+        if (file_exists("$dir/@middlewares.php")) {
+            $local = include "$dir/@middlewares.php";
+            if (is_array($local)) {
+                $context['middlewares'] = array_merge($context['middlewares'], $local);
+            }
+        }
     }
 
-    /*--------------------------------------------------------------------
-     | Execute file: decide web ou API
-     --------------------------------------------------------------------*/
-    protected function execute(?string $file, ServerRequestInterface $request): ResponseInterface
+    /**
+     * Aplica middlewares globais registrados por padrão de string.
+     */
+    protected function applyRouteMiddlewareRules(string $uri, array &$context): void
     {
-        $uriPath = $request->getUri()->getPath();
-        if (str_contains($uriPath, '/api/'))
-            return $this->renderApi($file, $request);
-        return $this->renderPage($file, $request);
+        foreach ($this->routeMiddlewareRules as $rule) {
+            // Transforma 'admin/*' em uma regex válida: '#^admin/.*$#'
+            $pattern = preg_quote($rule['pattern'], '#');
+            $pattern = str_replace('\*', '.*', $pattern);
+            $regex = '#^' . $pattern . '$#';
+
+            if (preg_match($regex, $uri)) {
+                $context['middlewares'] = array_merge($context['middlewares'], (array)$rule['middlewares']);
+            }
+        }
     }
 
-    /*--------------------------------------------------------------------
-     | Render API
-     --------------------------------------------------------------------*/
-    protected function renderApi(?string $file, ServerRequestInterface $request): ResponseInterface
+    /**
+     * Executa o arquivo final da rota (API ou Página).
+     */
+    protected function execute(?string $file, ServerRequestInterface $req, bool $isApi, array $context): ResponseInterface
+    {
+        if (!$file) {
+            if ($isApi) return $this->createErrorResponse("Not Found", 404, true);
+            if ($context['error404']) return $this->renderPage($context['error404'], $req, $context)->withStatus(404);
+            return $this->createErrorResponse("404 - Not Found", 404, false);
+        }
+
+        return $isApi ? $this->renderApi($file, $req) : $this->renderPage($file, $req, $context);
+    }
+
+    /**
+     * Renderiza resposta de API baseada em métodos HTTP (get, post...).
+     */
+    protected function renderApi(string $file, ServerRequestInterface $request): ResponseInterface
     {
         $method = strtolower($request->getMethod());
-
-        if (!$file || !file_exists($file)) {
-            return $this->factory->createResponse(404)
-                ->withHeader('Content-Type', 'application/json')
-                ->withBody($this->factory->createStream(json_encode(['error' => 'File not found'])));
-        }
         include_once $file;
+        if (!function_exists($method)) return $this->createErrorResponse("Method not allowed", 405, true);
 
-        if (function_exists($method)) {
-            $ret = $method($request);
-        } else {
-            return $this->factory->createResponse(405)
-                ->withHeader('Content-Type', 'application/json')
-                ->withBody($this->factory->createStream(json_encode(['error' => 'Method not allowed'])));
-        }
+        $result = $method($request);
+        if ($result instanceof ResponseInterface) return $result;
 
-        return $this->handleApiResponse('', $ret);
-    }
-
-    protected function handleApiResponse(string $content, mixed $ret): ResponseInterface
-    {
-        $body = is_string($content) ? $content : json_encode($ret);
+        $isJson = is_array($result) || is_object($result);
         return $this->factory->createResponse(200)
-            ->withHeader("Content-Type", "application/json")
-            ->withBody($this->factory->createStream($body));
+            ->withHeader("Content-Type", $isJson ? "application/json" : "text/plain")
+            ->withBody($this->factory->createStream($isJson ? json_encode($result) : (string)$result));
     }
 
-    /*--------------------------------------------------------------------
-     | Render page web + layouts + 404 hierárquico
-     --------------------------------------------------------------------*/
-    protected function renderPage(?string $file, ServerRequestInterface $request): ResponseInterface
+    /**
+     * Renderiza página HTML processando @controller e @layouts.
+     */
+    protected function renderPage(string $file, ServerRequestInterface $request, array $context): ResponseInterface
     {
-        if (!$file || !file_exists($file)) {
-            $file404 = $this->find404File($request);
-            if ($file404) return $this->renderPage($file404, $request);
-            return $this->factory->createResponse(404)
-                ->withHeader("Content-Type", "text/html")
-                ->withBody($this->factory->createStream("404 - Página não encontrada"));
+        $data = [];
+
+        // Processamento do Controller
+        if ($context['controller']) {
+            include_once $context['controller'];
+            $httpMethod = strtolower($request->getMethod());
+            if (function_exists($httpMethod)) {
+                $res = $httpMethod($request);
+                if ($res instanceof ResponseInterface) return $res;
+                if (is_array($res)) $data = $res;
+            }
         }
+
+        extract($data);
 
         ob_start();
-        $ret = include $file;
+        $output = include $file;
         $content = ob_get_clean();
 
-        if ($ret instanceof ResponseInterface) return $ret;
+        if ($output instanceof ResponseInterface) return $output;
 
-        return $this->handlePageResponse($content, $file, $request);
-    }
-
-    protected function handlePageResponse(string $content, string $file, ServerRequestInterface $request): ResponseInterface
-    {
-        $layouts = $this->loadLayouts($file);
-        $renderer = new PageRenderer($content, $layouts, $request);
-        $final = $renderer->render();
-
+        $renderer = new PageRenderer($content, $context['layouts'], $request);
         return $this->factory->createResponse(200)
             ->withHeader("Content-Type", "text/html")
-            ->withBody($this->factory->createStream($final));
+            ->withBody($this->factory->createStream($renderer->render()));
     }
 
-    protected function find404File(ServerRequestInterface $request): ?string
+    /**
+     * Localiza padrões [nome] no diretório.
+     */
+    protected function findDynamicSegments(string $dir): array
     {
-        $uriPath = trim($request->getUri()->getPath(), '/');
-        $basePath = $this->resolveBasePath($uriPath);
-        $segments = explode('/', $uriPath);
-        $dir = $basePath;
-
-        for ($i = 0; $i <= count($segments); $i++) {
-            $candidate = $dir . '/@404.php';
-            if (file_exists($candidate)) return $candidate;
-            $dir = dirname($dir);
-            if ($dir === rtrim($this->webPath, '/')) break;
-        }
-
-        return null;
+        return array_values(array_filter(scandir($dir), function ($entry) {
+            return preg_match('/^\[[a-zA-Z_][a-zA-Z0-9_]*\](\.php)?$/', $entry);
+        }));
     }
 
-    protected function loadLayouts(string $file): array
+    /**
+     * Cria resposta básica de erro.
+     */
+    protected function createErrorResponse(string $msg, int $code, bool $isApi): ResponseInterface
     {
-        $layouts = [];
-        $dir = dirname($file);
-        while (str_starts_with($dir, $this->webPath)) {
-            $layoutFile = "$dir/@layout.php";
-            if (file_exists($layoutFile)) $layouts[] = $layoutFile;
-            if ($dir === $this->webPath) break;
-            $dir = dirname($dir);
-        }
-        return array_reverse($layouts);
+        $res = $this->factory->createResponse($code);
+        return $isApi
+            ? $res->withHeader('Content-Type', 'application/json')->withBody($this->factory->createStream(json_encode(['error' => $msg])))
+            : $res->withHeader('Content-Type', 'text/html')->withBody($this->factory->createStream("<h1>$code</h1><p>$msg</p>"));
     }
 }
