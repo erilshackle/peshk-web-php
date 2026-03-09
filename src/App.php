@@ -35,11 +35,16 @@ class App
         $this->container->add(Psr17Factory::class)->setShared(true);
 
         // Instancia o WRH com a nova assinatura
-        $webRoot = $config['root_path'] ?? getcwd() . '/../web';
+        $webRoot = realpath($config['root_path'] ?? getcwd() . '/web');
         $this->router = new WebRequestHandler($webRoot, [
             'container' => $this->container,
             'context_domain' => $config['domain'] ?? null
         ]);
+    }
+
+    public function getContainer(): Container
+    {
+        return $this->container;
     }
 
     /**

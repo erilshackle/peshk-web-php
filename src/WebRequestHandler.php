@@ -7,6 +7,7 @@ use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use League\Container\Container;
+use Peshk\Web\Page\PageRenderer;
 
 /**
  * Gerenciador de requisições Web baseado em sistema de arquivos.
@@ -111,6 +112,7 @@ class WebRequestHandler
             'controller' => null
         ];
 
+       
         // 2. Coleta middlewares globais por pattern
         $this->applyRouteMiddlewareRules($mount['uri'], $context);
 
